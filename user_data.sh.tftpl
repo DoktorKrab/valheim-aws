@@ -1,0 +1,91 @@
+#!/bin/bash
+# Bootstrap serwera Valheim (Amazon Linux 2023). Renderowany przez Terraform.
+set -euxo pipefail
+exec > >(tee /var/log/valheim-bootstrap.log) 2>&1
+
+dnf install -y docker
+systemctl enable --now docker
+
+# --- Czekaj na podpięcie dysku EBS ze światem ---------------------------------
+VOL_ID="${replace(volume_id, "-", "")}"
+DEV=""
+for i in $(seq 1 120); do
+  for cand in "/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_$VOL_ID" /dev/xvdf /dev/sdf; do
+    if [ -b "$cand" ]; then DEV="$(readlink -f "$cand")"; break 2; fi
+  done
+  sleep 5
+done
+[ -n "$DEV" ] || { echo "Dysk danych nie został podpięty"; exit 1; }
+
+# Formatuj tylko jeśli dysk jest pusty (nie nadpisuj istniejącego świata!)
+if ! blkid "$DEV"; then
+  mkfs.xfs -L valheim-data "$DEV"
+fi
+
+mkdir -p /srv/valheim
+UUID="$(blkid -s UUID -o value "$DEV")"
+grep -q "$UUID" /etc/fstab || echo "UUID=$UUID /srv/valheim xfs defaults,nofail 0 2" >> /etc/fstab
+systemctl daemon-reload
+mount -a
+mkdir -p /srv/valheim/config /srv/valheim/data
+
+# --- Konfiguracja kontenera ---------------------------------------------------
+mkdir -p /etc/valheim
+cat > /etc/valheim/base.env <<'EOF'
+SERVER_NAME=${server_name}
+WORLD_NAME=${world_name}
+SERVER_PUBLIC=${server_public}
+TZ=${timezone}
+BACKUPS=true
+BACKUPS_MAX_AGE=7
+UPDATE_CRON=*/30 * * * *
+UPDATE_IF_IDLE=true
+RESTART_CRON=
+%{ for k, v in extra_env ~}
+${k}=${v}
+%{ endfor ~}
+EOF
+
+# Hasło pobierane z SSM przy każdym starcie (zmiana hasła = restart usługi).
+cat > /usr/local/bin/valheim-prestart <<'EOF'
+#!/bin/bash
+set -euo pipefail
+umask 077
+PASS="$(aws ssm get-parameter --region ${region} --name '${password_param}' --with-decryption --query Parameter.Value --output text)"
+{ cat /etc/valheim/base.env; echo "SERVER_PASS=$PASS"; } > /etc/valheim/valheim.env
+docker pull ghcr.io/lloesche/valheim-server:latest || true
+EOF
+chmod 700 /usr/local/bin/valheim-prestart
+
+cat > /etc/systemd/system/valheim.service <<'EOF'
+[Unit]
+Description=Valheim dedicated server (docker)
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+RequiresMountsFor=/srv/valheim
+
+[Service]
+Restart=always
+RestartSec=10
+TimeoutStartSec=600
+TimeoutStopSec=180
+ExecStartPre=/usr/local/bin/valheim-prestart
+ExecStartPre=-/usr/bin/docker rm -f valheim
+ExecStart=/usr/bin/docker run --rm --name valheim \
+  --env-file /etc/valheim/valheim.env \
+  -p 2456-2458:2456-2458/udp \
+  -v /srv/valheim/config:/config \
+  -v /srv/valheim/data:/opt/valheim \
+  --cap-add=sys_nice \
+  --stop-timeout 120 \
+  ghcr.io/lloesche/valheim-server:latest
+ExecStop=/usr/bin/docker stop -t 120 valheim
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now valheim.service
+

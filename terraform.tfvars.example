@@ -1,0 +1,10 @@
+server_name     = "Moj Serwer Valheim"
+world_name      = "Midgard"
+server_password = "zmien-mnie-123"
+
+# region         = "eu-central-1"
+# instance_type  = "m7i-flex.large"
+# server_public  = false
+# allowed_cidrs  = ["1.2.3.4/32"]
+# extra_env      = { BEPINEX = "true" }
+
